@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import json
 import time
 import uuid
 from collections import deque
@@ -30,6 +31,7 @@ from openai.types.responses import (
     ResponseStatus,
     ResponseTextDeltaEvent,
     ResponseTextDoneEvent,
+    ToolChoiceFunction,
     response_text_delta_event,
 )
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
@@ -51,8 +53,11 @@ from vllm.entrypoints.chat_utils import (
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.mcp.tool_server import ToolServer
 from vllm.entrypoints.openai.engine.protocol import (
+    DeltaFunctionCall,
     DeltaMessage,
+    DeltaToolCall,
     ErrorResponse,
+    FunctionDefinition,
     RequestResponseMetadata,
 )
 from vllm.entrypoints.openai.engine.serving import (
@@ -1345,6 +1350,17 @@ class OpenAIServingResponses(OpenAIServing):
         parser = self.parser(tokenizer, request.tools) if self.parser else None
         first_delta_sent = False
         previous_delta_messages: list[DeltaMessage] = []
+
+        # Forced tool_choice handling: detect mode once up-front
+        _forced_fn_name: str | None = (
+            request.tool_choice.name
+            if isinstance(request.tool_choice, ToolChoiceFunction)
+            else None
+        )
+        _forced_fn_name_sent = False
+        _required_tools = request.tool_choice == "required"
+        _required_buffer: list[str] = []
+
         async for ctx in result_generator:
             assert isinstance(ctx, SimpleContext)
             if ctx.last_output is None:
@@ -1369,6 +1385,33 @@ class OpenAIServingResponses(OpenAIServing):
                     )
                 if not delta_message:
                     continue
+
+                # -- Forced tool_choice: rewrite content → tool_calls --
+                if (
+                    delta_message.content
+                    and not delta_message.tool_calls
+                    and not delta_message.reasoning
+                ):
+                    if _forced_fn_name is not None:
+                        # ToolChoiceFunction: stream arguments directly
+                        fn_name = _forced_fn_name if not _forced_fn_name_sent else None
+                        _forced_fn_name_sent = True
+                        delta_message = DeltaMessage(
+                            tool_calls=[
+                                DeltaToolCall(
+                                    index=0,
+                                    function=DeltaFunctionCall(
+                                        name=fn_name,
+                                        arguments=delta_message.content,
+                                    ),
+                                )
+                            ],
+                        )
+                    elif _required_tools and delta_message.content:
+                        # tool_choice="required": buffer for end-of-stream
+                        _required_buffer.append(delta_message.content)
+                        continue
+
                 tool_call_item_started = False
                 if not first_delta_sent:
                     current_item_id = random_uuid()
@@ -1903,6 +1946,82 @@ class OpenAIServingResponses(OpenAIServing):
                         item=item,
                     )
                 )
+
+        # -- Emit buffered tool calls for tool_choice="required" --
+        if _required_buffer:
+            full_text = "".join(_required_buffer)
+            parsed_calls: list[tuple[str, str]] = []
+            try:
+                tool_defs = TypeAdapter(list[FunctionDefinition]).validate_json(
+                    full_text
+                )
+                for td in tool_defs:
+                    parsed_calls.append(
+                        (
+                            td.name,
+                            json.dumps(td.parameters, ensure_ascii=False)
+                            if td.parameters
+                            else "{}",
+                        )
+                    )
+            except Exception:
+                logger.warning(
+                    "Failed to parse required tool calls from streamed content: %s",
+                    full_text,
+                )
+            for tc_name, tc_args in parsed_calls:
+                tc_item_id = random_uuid()
+                tc_call_id = f"call_{random_uuid()}"
+                yield _increment_sequence_number_and_return(
+                    ResponseOutputItemAddedEvent(
+                        type="response.output_item.added",
+                        sequence_number=-1,
+                        output_index=current_output_index,
+                        item=ResponseFunctionToolCallItem(
+                            type="function_call",
+                            id=tc_item_id,
+                            call_id=tc_call_id,
+                            name=tc_name,
+                            arguments="",
+                            status="in_progress",
+                        ),
+                    )
+                )
+                yield _increment_sequence_number_and_return(
+                    ResponseFunctionCallArgumentsDeltaEvent(
+                        type="response.function_call_arguments.delta",
+                        sequence_number=-1,
+                        output_index=current_output_index,
+                        item_id=tc_item_id,
+                        delta=tc_args,
+                    )
+                )
+                yield _increment_sequence_number_and_return(
+                    ResponseFunctionCallArgumentsDoneEvent(
+                        type="response.function_call_arguments.done",
+                        sequence_number=-1,
+                        output_index=current_output_index,
+                        item_id=tc_item_id,
+                        arguments=tc_args,
+                        name=tc_name,
+                    )
+                )
+                yield _increment_sequence_number_and_return(
+                    ResponseOutputItemDoneEvent(
+                        type="response.output_item.done",
+                        sequence_number=-1,
+                        output_index=current_output_index,
+                        item=ResponseFunctionToolCall(
+                            type="function_call",
+                            name=tc_name,
+                            arguments=tc_args,
+                            status="completed",
+                            id=tc_item_id,
+                            call_id=tc_call_id,
+                        ),
+                    )
+                )
+                current_output_index += 1
 
     async def _process_harmony_streaming_events(
         self,
